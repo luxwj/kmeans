@@ -32,6 +32,7 @@ namespace detail {
 //on the large data array, and inside the optimization loop it's
 //called only on a small array, so it doesn't really matter.
 //If this becomes a performance limiter, transpose the data somewhere
+// dots[tid] = x*x + y*y + ...
 template<typename T>
 __global__ void self_dots(int n, int d, T* data, T* dots) {
 	T accumulator = 0;
@@ -46,7 +47,7 @@ __global__ void self_dots(int n, int d, T* data, T* dots) {
     }    
 }
 
-
+// dots[tid] = x*x + y*y + ...
 template<typename T>
 void make_self_dots(int n, int d,
                     thrust::device_vector<T>& data,

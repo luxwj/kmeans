@@ -15,7 +15,6 @@ limitations under the License.
 */
 #include <thrust/device_vector.h>
 #include "kmeans.h"
-#include "timer.h"
 #include <iostream>
 #include <cstdlib>
 #include <typeinfo>
@@ -168,12 +167,7 @@ void huge_test() {
     
     random_data(data, n, d);
     random_labels(labels, n, k);
-    kmeans::timer t;
-    t.start();
     kmeans::kmeans(iterations, n, d, k, data, labels, centroids, distances);
-    float time = t.stop();
-    std::cout << "  Time: " << time/1000.0 << " s" << std::endl;
-
 }
 
 int main() {

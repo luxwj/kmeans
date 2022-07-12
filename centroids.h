@@ -51,6 +51,8 @@ void update_centroid(int label, int dimension,
     }             
 }
 
+// threadIdx.x is used to represent the dimension of the same point
+// threadIdx.y is used to represent the point index
 template<typename T>
 __global__ void calculate_centroids(int n, int d, int k,
                                     T* data,
