@@ -1,8 +1,9 @@
-kmeans
+kmeans (forked from bryancatanzaro)
 ======
 
 A simple kmeans clustering implementation for single and
 double precision data, written for CUDA GPUs.
+
 
 There are two ideas here:
 
@@ -25,3 +26,9 @@ performance with high programmer productivity. Although this code is
 simple, it is still high performance - we have measured it running at
 up to 8x the rate of other CUDA kmeans implementations on the same
 hardware. This is because we use a more efficient algorithm.
+
+## Log 220712
+
+reading the code
+next time from: test::423
+* int changes = relabel(SITES_NUMBER, KMEANS_K, pairwise_distances, labels, distances);
