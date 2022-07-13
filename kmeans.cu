@@ -212,17 +212,18 @@ void calculate_distances(thrust::device_vector<T>& data,
          SITES_NUMBER); //Has to be n or k
 }
 
+// Each thread traverse all centroid and determine the nearest centroid to one point.
+// The distance to the new centroid is stored in array distances.
+// Atomic add the count of changes to the global variable changes, which should be comment out for performance.
 template<typename T>
-__global__ void make_new_labels(int n, int k, T* pairwise_distances,
-                                int* labels, int* changes,
-                                T* distances) {
+__global__ void make_new_labels(T* pairwise_distances, int* labels, int* changes, T* distances) {
     T min_distance = DBL_MAX;
     T min_idx = -1;
     int global_id = threadIdx.x + blockIdx.x * blockDim.x;
-    if (global_id < n) {
+    if (global_id < SITES_NUMBER) {
         int old_label = labels[global_id];
-        for(int c = 0; c < k; c++) {
-            T distance = pairwise_distances[c * n + global_id];
+        for(int c = 0; c < KMEANS_K; c++) {
+            T distance = pairwise_distances[c * SITES_NUMBER + global_id];
             if (distance < min_distance) {
                 min_distance = distance;
                 min_idx = c;
@@ -236,48 +237,70 @@ __global__ void make_new_labels(int n, int k, T* pairwise_distances,
     }
 }
 
-
+// Call a kernel function to recalculate the nearest centroid to each point.
+// Return the count of points that changed their label (nearest centroid).
 template<typename T>
-int relabel(int n, int k,
-            thrust::device_vector<T>& pairwise_distances,
+int relabel(thrust::device_vector<T>& pairwise_distances,
             thrust::device_vector<int>& labels,
             thrust::device_vector<T>& distances) {
     thrust::device_vector<int> changes(1);
     changes[0] = 0;
-    make_new_labels<<<(n-1)/256+1,256>>>(
-        n, k,
-        thrust::raw_pointer_cast(pairwise_distances.data()),
+    dim3 gridDim = dim3((n-1)/256+1);
+    dim3 blockDim = dim3(256);
+    make_new_labels<<<gridDim, blockDim>>>(thrust::raw_pointer_cast(pairwise_distances.data()),
         thrust::raw_pointer_cast(labels.data()),
         thrust::raw_pointer_cast(changes.data()),
         thrust::raw_pointer_cast(distances.data()));
     return changes[0];
 }
 
+/**
+ * @brief Add the value in accumulator to target (a coord of centroid)
+ * 
+ * @param label the index of the centroid (add the dimension to label, to get the index of a coord)
+ * @param dimension current coord's dimension
+ * @param accumulator the value to be added to the target (a coord of the centroid)
+ * @param centroids the coord array of centroids
+ * @param count record how many points are classified to this centroid
+ * @param counts_cen the count array of each centroid
+ */
 template<typename T>
 __device__ __forceinline__
 void update_centroid(int label, int dimension,
-                     int d,
                      T accumulator, T* centroids,
-                     int count, int* counts) {
-    int index = label * d + dimension;
+                     int count, int* counts_cen) {
+    int index = label * DIM + dimension;
     T* target = centroids + index;
     atomicAdd(target, accumulator);
     if (dimension == 0) {
-        atomicAdd(counts + label, count);
+        atomicAdd(counts_cen + label, count);
     }             
 }
 
-// threadIdx.x is used to represent the dimension of the same point
-// threadIdx.y is used to represent the point index
+
+
+/**
+ * @brief This function only adds up the point coords but not divide the count.
+ * threadIdx.x is used to represent the dimension of the same point
+ * threadIdx.y is used to represent the point index
+ * 
+ * @param data point coord
+ * @param ordered_labels labels of each point
+ * @param ordered_indices data array did not change the order, use this idx array to access data array
+ * @param centroids output, the new centroids
+ * @param counts_cen output, the point count in each cluster
+ */
 template<typename T>
 __global__ void calculate_centroids(T* data, int* ordered_labels,
-    int* ordered_indices, T* centroids, int* counts) {
+    int* ordered_indices, T* centroids, int* counts_cen) {
     int in_flight = blockDim.y * gridDim.y;
-    int labels_per_row = (SITES_NUMBER - 1) / in_flight + 1; 
+    int labels_per_row = (SITES_NUMBER - 1) / in_flight + 1;
+
+    // accumulate the coord in each dimension
     for(int dimension = threadIdx.x; dimension < DIM; dimension += blockDim.x) {
         T accumulator = 0;
         int count = 0;
-        int global_id = threadIdx.y + blockIdx.y * blockDim.y;
+        int global_id = threadIdx.y + blockIdx.y * blockDim.y;      // index of point
         int start = global_id * labels_per_row;
         int end = (global_id + 1) * labels_per_row;
         end = (end > SITES_NUMBER) ? SITES_NUMBER : end;
@@ -287,9 +310,11 @@ __global__ void calculate_centroids(T* data, int* ordered_labels,
         
             for(int label_number = start; label_number < end; label_number++) {
                 int label = ordered_labels[label_number];
+                // a few points in prior have defferent label as the current point, 
+                // process the accumulator and the count, then reset it
                 if (label != prior_label) {
-                    update_centroid(prior_label, dimension, DIM,
-                                    accumulator, centroids, count, counts);
+                    update_centroid(prior_label, dimension,
+                                    accumulator, centroids, count, counts_cen);
                     accumulator = 0;
                     count = 0;
                 }
@@ -299,8 +324,8 @@ __global__ void calculate_centroids(T* data, int* ordered_labels,
                 prior_label = label;
                 count++;
             }
-            update_centroid(prior_label, dimension, DIM,
-                            accumulator, centroids, count, counts);
+            update_centroid(prior_label, dimension,
+                            accumulator, centroids, count, counts_cen);
         }
     }
 }
@@ -360,7 +385,7 @@ void find_centroids(thrust::device_vector<T>& data,
          thrust::raw_pointer_cast(centroids.data()),
          thrust::raw_pointer_cast(counts.data()));
     
-    //Scale centroids
+    //Scale centroids, because the calculate_centroid kernel just add the coord up.
     scale_centroids<<<dim3((DIM - 1)/32 + 1, (KMEANS_K - 1)/32 + 1), dim3(32, 32)>>>
         (thrust::raw_pointer_cast(counts.data()),
          thrust::raw_pointer_cast(centroids.data()));
@@ -421,14 +446,15 @@ int kmeans(int iterations,
         calculate_distances(data, centroids, data_dots,
             centroid_dots, pairwise_distances);
 
-        int changes = relabel(SITES_NUMBER, KMEANS_K, pairwise_distances, labels, distances);
-       
+        // debug: print the count of changes
+        int changes = relabel(pairwise_distances, labels, distances);
         
         find_centroids(data, labels, centroids);
         T distance_sum = thrust::reduce(distances.begin(), distances.end());
         std::cout << "Iteration " << i << " produced " << changes
                   << " changes, and total distance is " << distance_sum << std::endl;
 
+        // early terminating condition
         if (i > 0) {
             T delta = distance_sum / prior_distance_sum;
             if (delta > 1 - threshold) {

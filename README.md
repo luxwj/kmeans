@@ -30,5 +30,7 @@ hardware. This is because we use a more efficient algorithm.
 ## Log 220712
 
 reading the code
-next time from: test::423
-* int changes = relabel(SITES_NUMBER, KMEANS_K, pairwise_distances, labels, distances);
+
+## Log 220713
+
+Read the code through the main function. The problem is that this implementation does not set an upper bound count of each cluster.
