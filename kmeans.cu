@@ -32,9 +32,20 @@ limitations under the License.
 #include <cfloat>
 #include <cublas_v2.h>
 
-#define SITES_NUMBER 5
-#define DIM 3
-#define KMEANS_K 2
+#include "kmeans.h"
+
+// set to 1 to print informations, set to 0 for performance
+#define KMEANS_DEBUG 0
+// 0.001%
+#define EARLY_TERM_THRES 0.00001
+#define MAX_KMEANS_ITER 50
+
+#if KMEANS_DEBUG == 1
+#define PIC_WIDTH 2048
+#define SITES_NUMBER 100000
+#define DIM 2
+#define KMEANS_K 128
+#endif
 
 //data: points in row-major order (SITES_NUMBER rows, DIM cols)
 //dots: result vector (SITES_NUMBER rows). dots[tid] = x*x + y*y + ...
@@ -59,11 +70,18 @@ __global__ void self_dots(T* data, T* dots) {
     }    
 }
 
-// dots[tid] = x*x + y*y + ...
+/**
+ * @brief dots[tid] = x*x + y*y + ...
+ * 
+ * @param data 
+ * @param dots 
+ * @param data_size the array length of data
+ */
 template<typename T>
 void make_self_dots(thrust::device_vector<T>& data,
-                    thrust::device_vector<T>& dots) {
-    self_dots<<<(SITES_NUMBER - 1)/256+1, 256>>>(thrust::raw_pointer_cast(data.data()),
+                    thrust::device_vector<T>& dots,
+                    const int data_size) {
+    self_dots<<<(data_size - 1)/256+1, 256>>>(thrust::raw_pointer_cast(data.data()),
         thrust::raw_pointer_cast(dots.data()));
 }
 
@@ -189,7 +207,7 @@ void calculate_distances(thrust::device_vector<T>& data,
                          thrust::device_vector<T>& data_dots,
                          thrust::device_vector<T>& centroid_dots,
                          thrust::device_vector<T>& pairwise_distances) {
-    make_self_dots(centroids, centroid_dots);
+    make_self_dots(centroids, centroid_dots, KMEANS_K);
     make_all_dots(data_dots, centroid_dots, pairwise_distances);
     // C = alpha * A * B + beta * C
     //||x - y||^2 = ||x||^2 + ||y||^2 - 2xy
@@ -245,7 +263,7 @@ int relabel(thrust::device_vector<T>& pairwise_distances,
             thrust::device_vector<T>& distances) {
     thrust::device_vector<int> changes(1);
     changes[0] = 0;
-    dim3 gridDim = dim3((n-1)/256+1);
+    dim3 gridDim = dim3((SITES_NUMBER - 1) / 256 + 1);
     dim3 blockDim = dim3(256);
     make_new_labels<<<gridDim, blockDim>>>(thrust::raw_pointer_cast(pairwise_distances.data()),
         thrust::raw_pointer_cast(labels.data()),
@@ -349,16 +367,25 @@ __global__ void scale_centroids(int* counts, T* centroids) {
     }
 }
 
-// the result coordinates are stored in centroids, 
+/**
+ * @brief 
+ * 
+ * @param data 
+ * @param labels 
+ * @param centroids Stores the result coordinates
+ * @param counts Stores the point count in each cluster
+ */
 template<typename T>
 void find_centroids(thrust::device_vector<T>& data,
                     //Labels are taken by value because
                     //they get destroyed in sort_by_key
                     //So we need to make a copy of them
                     thrust::device_vector<int> labels,
-                    thrust::device_vector<T>& centroids) {
+                    thrust::device_vector<T>& centroids,
+                    thrust::device_vector<int>& point_counts) {
     thrust::device_vector<int> indices(SITES_NUMBER);
-    thrust::device_vector<int> counts(KMEANS_K);
+    // reset point_counts to all zeros
+    thrust::fill(point_counts.begin(), point_counts.end(), 0);
 
     thrust::copy(thrust::counting_iterator<int>(0),
                  thrust::counting_iterator<int>(SITES_NUMBER),
@@ -383,11 +410,11 @@ void find_centroids(thrust::device_vector<T>& data,
          thrust::raw_pointer_cast(labels.data()),
          thrust::raw_pointer_cast(indices.data()),
          thrust::raw_pointer_cast(centroids.data()),
-         thrust::raw_pointer_cast(counts.data()));
+         thrust::raw_pointer_cast(point_counts.data()));
     
     //Scale centroids, because the calculate_centroid kernel just add the coord up.
     scale_centroids<<<dim3((DIM - 1)/32 + 1, (KMEANS_K - 1)/32 + 1), dim3(32, 32)>>>
-        (thrust::raw_pointer_cast(counts.data()),
+        (thrust::raw_pointer_cast(point_counts.data()),
          thrust::raw_pointer_cast(centroids.data()));
 }
 
@@ -416,10 +443,9 @@ void find_centroids(thrust::device_vector<T>& data,
   initialized before calling kmeans. Defaults to true, which means
   the labels must be initialized.
   \param threshold This controls early termination of the kmeans
-  iterations. If the ratio of the sum of distances from points to
-  centroids from this iteration to the previous iteration changes by
-  less than the threshold, than the iterations are
-  terminated. Defaults to 0.000001
+  iterations. When the sum of distances from points to centroids 
+  between two iterations changes by less than the threshold, 
+  the iterations are terminated.
   \return The number of iterations actually performed.
 */
 template<typename T>
@@ -429,16 +455,17 @@ int kmeans(int iterations,
            thrust::device_vector<T>& centroids,
            thrust::device_vector<T>& distances,
            bool init_from_labels=true,
-           double threshold=0.000001) {
+           double threshold=EARLY_TERM_THRES) {
     thrust::device_vector<T> data_dots(SITES_NUMBER);
     // in the original version, the size of centroid_dots is SITES_NUMBER (n)
     thrust::device_vector<T> centroid_dots(KMEANS_K);
+    thrust::device_vector<int> point_counts(KMEANS_K);      // the number of points in each cluster
     thrust::device_vector<T> pairwise_distances(SITES_NUMBER * KMEANS_K);
     
-    make_self_dots(data, data_dots);
+    make_self_dots(data, data_dots, SITES_NUMBER);
 
     if (init_from_labels) {
-        find_centroids(data, labels, centroids);
+        find_centroids(data, labels, centroids, point_counts);
     }   
     T prior_distance_sum = 0;
     int i = 0;
@@ -449,41 +476,48 @@ int kmeans(int iterations,
         // debug: print the count of changes
         int changes = relabel(pairwise_distances, labels, distances);
         
-        find_centroids(data, labels, centroids);
+        find_centroids(data, labels, centroids, point_counts);
         T distance_sum = thrust::reduce(distances.begin(), distances.end());
+
+#if KMEANS_DEBUG == 1
         std::cout << "Iteration " << i << " produced " << changes
                   << " changes, and total distance is " << distance_sum << std::endl;
+#endif
 
         // early terminating condition
         if (i > 0) {
-            T delta = distance_sum / prior_distance_sum;
-            if (delta > 1 - threshold) {
+            T delta = abs((distance_sum - prior_distance_sum) / prior_distance_sum);
+            if (delta < threshold) {
+#if KMEANS_DEBUG == 1
                 std::cout << "Threshold triggered, terminating iterations early" << std::endl;
+                // debug, print the point count in each cluster
+                thrust::host_vector<int> point_counts_h = point_counts;      // the number of points in each cluster
+                int *point_counts_raw = thrust::raw_pointer_cast(point_counts_h.data());
+                for (int cl = 0; cl < KMEANS_K; ++cl) {
+                    printf("Number of points in cluster %d: %d\n", cl, point_counts_raw[cl]);
+                }
+#endif
                 return i + 1;
             }
         }
         prior_distance_sum = distance_sum;
     }
-    return i;
-}
 
-template<typename T>
-void print_array(T& array, int m, int n) {
-    for(int i = 0; i < m; i++) {
-        for(int j = 0; j < n; j++) {
-            typename T::value_type value = array[i * n + j];
-            std::cout << value << ' ';
-            // printf("%f ", value);
-        }
-        std::cout << std::endl;
+#if KMEANS_DEBUG == 1
+    // debug, print the point count in each cluster
+    for (int cl = 0; cl < KMEANS_K; ++cl) {
+        printf("Number of points in cluster %d: %d\n", cl, (int)point_counts[cl]);
     }
+#endif
+
+    return i;
 }
 
 template<typename T>
 void random_data(thrust::device_vector<T>& array, int m, int n) {
     thrust::host_vector<T> host_array(m*n);
     for(int i = 0; i < m * n; i++) {
-        host_array[i] = (T)rand()/(T)RAND_MAX;
+        host_array[i] = (T)rand() / (T)RAND_MAX * (T)PIC_WIDTH;
     }
     array = host_array;
 }
@@ -496,162 +530,130 @@ void random_labels(thrust::device_vector<int>& labels, int n, int k) {
     labels = host_labels;
 }
 
+// Use kmeans++ method to init the centroids
+template<typename T>
+void kmeans_plus_plus(T *data, T *centroids) {
+    // probility to be a centroid of each point
+    double prob[SITES_NUMBER];
+    // stores the distance of each point to the nearest centroid
+    double dist[SITES_NUMBER];
+    double total_dist;
+    // init prob of all point to 1/SITES_NUMBER
+    for (int i = 0; i < SITES_NUMBER; ++i) {
+        prob[i] = 1/SITES_NUMBER;
+    }
 
-void tiny_test() {
-    int iterations = 3;
-
-    thrust::device_vector<double> data(SITES_NUMBER * DIM);
-    thrust::device_vector<int> labels(SITES_NUMBER);
-    thrust::device_vector<double> centroids(KMEANS_K * DIM);
-    thrust::device_vector<double> distances(SITES_NUMBER);
-    
-    // debug
-    printf("Before generating data\n");
-
-    // generate data (point coordinates)
-    for(int i = 0; i < SITES_NUMBER; i++) {
-        for(int d = 0; d < DIM; d++) {
-            data[i * DIM + d] = (i % 2) * 3 + d;
+    // randomly choose the first centroid
+    double ran_num = (T)rand() / (T)RAND_MAX;
+    for (int i = 0; i < SITES_NUMBER; ++i) {
+        ran_num -= prob[i];
+        if (ran_num <= 0) {     // select the point that make the ran_num less than 0
+            for (int d = 0; d < DIM; ++d)
+                centroids[0 * DIM + d] = data[i * DIM + d];
+            break;
         }
     }
 
-    // debug
-    printf("After generating data\n");
+    // compute the dist from each point to the first centroid
+    total_dist = 0;
+    for (int i = 0; i < SITES_NUMBER; ++i) {
+        dist[i] = 0;
+        for (int d = 0; d < DIM; ++d)
+            dist[i] += (data[i * DIM + d] - centroids[0 * DIM + d]) * (data[i * DIM + d] - centroids[0 * DIM + d]);
+        total_dist += dist[i];
+    }
 
-    std::cout << "Data: " << std::endl;
-    print_array(data, SITES_NUMBER, DIM);
+    // compute the remaining clusters
+    for (int cl = 1; cl < KMEANS_K; ++cl) {
 
-    labels[0] = 0;
-    labels[1] = 0;
-    labels[2] = 0;
-    labels[3] = 1;
-    labels[4] = 1;
+        // change the prob based on the dist
+        for (int i = 0; i < SITES_NUMBER; ++i) {
+            prob[i] = dist[i] / total_dist;
+        }
 
-    std::cout << "Labels: " << std::endl;
-    print_array(labels, SITES_NUMBER, 1);
-    
-    // debug
-    printf("before kmeans\n");
+        ran_num = (T)rand() / (T)RAND_MAX;      // a new random number
+        for (int i = 0; i < SITES_NUMBER; ++i) {
+            ran_num -= prob[i];
+            if (ran_num <= 0) {     // select the point that make the ran_num less than 0
+                for (int d = 0; d < DIM; ++d)
+                    centroids[cl * DIM + d] = data[i * DIM + d];
+                break;
+            }
+        }
 
-    int i = kmeans(iterations, data, labels, centroids, distances);
-    std::cout << "Performed " << i << " iterations" << std::endl;
-
-    std::cout << "Labels: " << std::endl;
-    print_array(labels, SITES_NUMBER, 1);
-
-    std::cout << "Centroids:" << std::endl;
-    print_array(centroids, KMEANS_K, DIM);
-
-    std::cout << "Distances:" << std::endl;
-    print_array(distances, SITES_NUMBER, 1);
-
-}
-
-
-void more_tiny_test() {
-	double dataset[] = {
-		0.5, 0.5,
-		1.5, 0.5,
-		1.5, 1.5,
-		0.5, 1.5,
-		1.1, 1.2,
-		0.5, 15.5,
-		1.5, 15.5,
-		1.5, 16.5,
-		0.5, 16.5,
-		1.2, 16.1,
-		15.5, 15.5,
-		16.5, 15.5,
-		16.5, 16.5,
-		15.5, 16.5,
-		15.6, 16.2,
-		15.5, 0.5,
-		16.5, 0.5,
-		16.5, 1.5,
-		15.5, 1.5,
-		15.7, 1.6};
-	double centers[] = {
-		0.5, 0.5,
-		1.5, 0.5,
-		1.5, 1.5,
-		0.5, 1.5};
-	 
-    int iterations = 3;
-    int n = 20;
-    int d = 2;
-    int k = 4;
-	
-	thrust::device_vector<double> data(dataset, dataset+n*d);
-    thrust::device_vector<int> labels(n);
-    thrust::device_vector<double> centroids(centers, centers+k*d);
-    thrust::device_vector<double> distances(n);
-    
-    kmeans(iterations, data, labels, centroids, distances, false);
-
-    std::cout << "Labels: " << std::endl;
-    print_array(labels, n, 1);
-
-    std::cout << "Centroids:" << std::endl;
-    print_array(centroids, k, d);
+        // compute the dist from each point to the neaerst centroid
+        total_dist = 0;
+        for (int i = 0; i < SITES_NUMBER; ++i) {
+            dist[i] = DBL_MAX;
+            for (int cur_cl = 0; cur_cl < cl; ++cur_cl) {
+                double cur_dist = 0;
+                for (int d = 0; d < DIM; ++d)
+                    cur_dist += (data[i * DIM + d] - centroids[cur_cl * DIM + d]) * (data[i * DIM + d] - centroids[cur_cl * DIM + d]);
+                if (cur_dist < dist[i]) {
+                    dist[i] = cur_dist;
+                }
+            }
+            total_dist += dist[i];
+        }
+    }
 
 }
 
+/**
+ * @brief generate k clusters using kmeans method
+ * The centroids of each clusters are initialized with kmeans++ method
+ * 
+ * @param data_raw input data, its size is [SITES_NUMBER * DIM]
+ * @param labels_raw output data, assign a label to each data point
+ */
 template<typename T>
-void huge_test() {
+void gen_kclusters(T *data_raw, T* labels_raw) {
+	T centroids_raw[KMEANS_K * DIM];
+    // TODO: Use kmeans++ to init this array
+    kmeans_plus_plus(data_raw, centroids_raw);
+	
+	thrust::device_vector<double> data(data_raw, data_raw + SITES_NUMBER * DIM);
+    thrust::device_vector<double> centroids(centroids_raw, centroids_raw + KMEANS_K * DIM);
+    thrust::device_vector<int> labels(SITES_NUMBER);
+    thrust::device_vector<double> distances(SITES_NUMBER);
 
+    kmeans(MAX_KMEANS_ITER, data, labels, centroids, distances, false);
+
+    for(int i = 0; i < SITES_NUMBER; ++i)
+        labels_raw[i] = labels[i];
+}
+
+
+#if KMEANS_DEBUG == 1
+template<typename T>
+void test() {
     int iterations = 50;
-    int n = 1e5;
-    int d = 64;
-    int k = 128;
 
-    thrust::device_vector<T> data(n * d);
-    thrust::device_vector<int> labels(n);
-    thrust::device_vector<T> centroids(k * d);
-    thrust::device_vector<T> distances(n);
+    T data_raw[SITES_NUMBER * DIM];
+    // init data_raw with random number
+    for(int i = 0; i < SITES_NUMBER * DIM; i++) {
+        data_raw[i] = (T)rand() / (T)RAND_MAX * (T)PIC_WIDTH;
+    }
+
+	T centroids_raw[KMEANS_K * DIM];
+    // TODO: Use kmeans++ to init this array
+    kmeans_plus_plus(data_raw, centroids_raw);
+	
+	thrust::device_vector<double> data(data_raw, data_raw + SITES_NUMBER * DIM);
+    thrust::device_vector<double> centroids(centroids_raw, centroids_raw + KMEANS_K * DIM);
+    thrust::device_vector<int> labels(SITES_NUMBER);
+    thrust::device_vector<double> distances(SITES_NUMBER);
     
-    std::cout << "Generating random data" << std::endl;
-    std::cout << "Number of points: " << n << std::endl;
-    std::cout << "Number of dimensions: " << d << std::endl;
-    std::cout << "Number of clusters: " << k << std::endl;
     std::cout << "Number of iterations: " << iterations << std::endl;
     std::cout << "Precision: " << typeid(T).name() << std::endl;
-    
-    random_data(data, n, d);
-    random_labels(labels, n, k);
-    kmeans(iterations, data, labels, centroids, distances);
+
+    int i = kmeans(iterations, data, labels, centroids, distances, false);
+
+    std::cout << "Performed " << i << " iterations" << std::endl;
 }
 
 int main() {
-    std::cout << "Input a character to choose a test:" << std::endl;
-    std::cout << "Tiny test: t" << std::endl;
-    std::cout << "More tiny test: m" << std::endl;
-    std::cout << "Huge test: h: " << std::endl;
-    char c = 't';
-
-    switch (c) {
-    case 't':
-        tiny_test();
-        exit(0);
-    case 'm':
-        more_tiny_test();
-        exit(0);
-    case 'h':
-        break;
-    default:
-        std::cout << "Choice not understood, running huge test" << std::endl;
-    }
-    std::cout << "Double precision (d) or single precision (f): " << std::endl;
-    std::cin >> c;
-    switch(c) {
-    case 'd':
-        huge_test<double>();
-        exit(0);
-    case 'f':
-        break;
-    default:
-        std::cout << "Choice not understood, running single precision"
-                  << std::endl;
-    }
-    huge_test<float>();
-    
+    test<double>();
+    // test<float>();
 }
+#endif

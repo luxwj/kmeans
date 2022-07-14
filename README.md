@@ -34,3 +34,11 @@ reading the code
 ## Log 220713
 
 Read the code through the main function. The problem is that this implementation does not set an upper bound count of each cluster.
+
+## Log 220714
+
+Bug fixed:
+* adjusted the early termination condition
+
+TODO:
+* Use kmeans++ for centroid initialization
