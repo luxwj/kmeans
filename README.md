@@ -40,5 +40,5 @@ Read the code through the main function. The problem is that this implementation
 Bug fixed:
 * adjusted the early termination condition
 
-TODO:
+New features:
 * Use kmeans++ for centroid initialization
