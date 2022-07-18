@@ -4,7 +4,7 @@ kmeans (forked from bryancatanzaro)
 A simple kmeans clustering implementation for single and
 double precision data, written for CUDA GPUs.
 
-
+## Memos from bryancatanzaro
 There are two ideas here:
 
   1. The relabel step of kmeans relies on computing distances between
@@ -26,6 +26,13 @@ performance with high programmer productivity. Although this code is
 simple, it is still high performance - we have measured it running at
 up to 8x the rate of other CUDA kmeans implementations on the same
 hardware. This is because we use a more efficient algorithm.
+
+## Time complexity of the sequential k-means
+This implementation is an approximate k-means clustering algorithm, the time complexity is $O(n * k * d * i)$, where 
+* $n$ is the point count
+* $k$ is the cluster count
+* $d$ is the dimension of a point
+* $i$ is a fixed number of iteration count
 
 ## Log 220712
 
