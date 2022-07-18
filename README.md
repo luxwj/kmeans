@@ -49,3 +49,7 @@ Bug fixed:
 
 New features:
 * Use kmeans++ for centroid initialization
+
+## Log 220718
+
+Now point count and cluster count can be inputted by user.

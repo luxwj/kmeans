@@ -10,6 +10,6 @@
  * @param labels_raw output data, assign a label to each data point
  */
 template<typename T>
-void gen_kclusters(T *data_raw, T* labels_raw);
+void gen_kclusters(T *data_raw, T* labels_raw, int kmeans_point_count, int kmeans_cluster_count);
 
 #endif

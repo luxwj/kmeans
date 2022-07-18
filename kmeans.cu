@@ -35,20 +35,25 @@ limitations under the License.
 #include "kmeans.h"
 
 // set to 1 to print informations, set to 0 for performance
-#define KMEANS_DEBUG 0
+#define KMEANS_DEBUG 1
 // 0.001%
 #define EARLY_TERM_THRES 0.00001
 #define MAX_KMEANS_ITER 50
 
-#if KMEANS_DEBUG == 1
+#if KMEANS_DEBUG == 0
+// given as parameters in gen_kclusters
+static int kmeans_point_count;
+static int kmeans_cluster_count;
+
+#elif KMEANS_DEBUG == 1
 #define PIC_WIDTH 2048
-#define SITES_NUMBER 100000
+static int kmeans_point_count = 100000;
+static int kmeans_cluster_count = 128;
 #define DIM 2
-#define KMEANS_K 128
 #endif
 
-//data: points in row-major order (SITES_NUMBER rows, DIM cols)
-//dots: result vector (SITES_NUMBER rows). dots[tid] = x*x + y*y + ...
+//data: points in row-major order (kmeans_point_count rows, DIM cols)
+//dots: result vector (kmeans_point_count rows). dots[tid] = x*x + y*y + ...
 // NOTE:
 //Memory accesses in this function are uncoalesced!!
 //This is because data is in row major order
@@ -57,11 +62,11 @@ limitations under the License.
 //called only on a small array, so it doesn't really matter.
 //If this becomes a performance limiter, transpose the data somewhere
 template<typename T>
-__global__ void self_dots(T* data, T* dots) {
+__global__ void self_dots(T* data, T* dots, int point_count) {
 	T accumulator = 0;
     int global_id = blockDim.x * blockIdx.x + threadIdx.x;
 
-    if (global_id < SITES_NUMBER) {
+    if (global_id < point_count) {
         for (int i = 0; i < DIM; i++) {
             T value = data[i + global_id * DIM];
             accumulator += value * value;
@@ -82,31 +87,31 @@ void make_self_dots(thrust::device_vector<T>& data,
                     thrust::device_vector<T>& dots,
                     const int data_size) {
     self_dots<<<(data_size - 1)/256+1, 256>>>(thrust::raw_pointer_cast(data.data()),
-        thrust::raw_pointer_cast(dots.data()));
+        thrust::raw_pointer_cast(dots.data()), kmeans_point_count);
 }
 
 
 /**
  * @brief dots(x, y) = data_dots[x] + centroid_dots[y], each block computes a 32x32 region
  * 
- * @param data_dots size = (SITES_NUMBER)
- * @param centroid_dots size = (KMEANS_K)
- * @param dots pairwise_distance, size = (SITES_NUMBER * KMEANS_K)
+ * @param data_dots size = point_count
+ * @param centroid_dots size = cluster_count
+ * @param dots pairwise_distance, size = point_count * cluster_count
  */
 template<typename T>
-__global__ void all_dots(T* data_dots, T* centroid_dots, T* dots) {
+__global__ void all_dots(T* data_dots, T* centroid_dots, T* dots, int point_count, int cluster_count) {
 	__shared__ T local_data_dots[32];
 	__shared__ T local_centroid_dots[32];
 
     // copy 32 elements into local array
     int data_index = threadIdx.x + blockIdx.x * blockDim.x;
-    if ((data_index < SITES_NUMBER) && (threadIdx.y == 0)) {
+    if ((data_index < point_count) && (threadIdx.y == 0)) {
         local_data_dots[threadIdx.x] = data_dots[data_index];
     }
     
     // copy 32 elements into local array, use thread 1 to parallelize the copy with thread 0 (above)
     int centroid_index = threadIdx.x + blockIdx.y * blockDim.y;
-    if ((centroid_index < KMEANS_K) && (threadIdx.y == 1)) {
+    if ((centroid_index < cluster_count) && (threadIdx.y == 1)) {
         local_centroid_dots[threadIdx.x] = centroid_dots[centroid_index];
     }
 
@@ -114,8 +119,8 @@ __global__ void all_dots(T* data_dots, T* centroid_dots, T* dots) {
 
     // in a global aspect, dots(x, y) = data_dots[x] + centroid_dots[y]
 	centroid_index = threadIdx.y + blockIdx.y * blockDim.y;
-    if ((data_index < SITES_NUMBER) && (centroid_index < KMEANS_K)) {
-        dots[data_index + centroid_index * SITES_NUMBER] = local_data_dots[threadIdx.x] +
+    if ((data_index < point_count) && (centroid_index < cluster_count)) {
+        dots[data_index + centroid_index * point_count] = local_data_dots[threadIdx.x] +
             local_centroid_dots[threadIdx.y];
     }
 }
@@ -123,19 +128,19 @@ __global__ void all_dots(T* data_dots, T* centroid_dots, T* dots) {
 /**
  * @brief dots(x, y) = data_dots[x] + centroid_dots[y], each block computes a 32x32 region
  * 
- * @param data_dots size = (SITES_NUMBER)
- * @param centroid_dots size = (KMEANS_K)
- * @param dots pairwise_distance, size = (SITES_NUMBER * KMEANS_K)
+ * @param data_dots size = kmeans_point_count
+ * @param centroid_dots size = kmeans_cluster_count
+ * @param dots pairwise_distance, size = kmeans_point_count * kmeans_cluster_count
  */
 template<typename T>
 void make_all_dots(thrust::device_vector<T>& data_dots,
                    thrust::device_vector<T>& centroid_dots,
                    thrust::device_vector<T>& dots) {
-    dim3 gridDim = dim3((SITES_NUMBER - 1)/32 + 1, (KMEANS_K - 1)/32 + 1);
+    dim3 gridDim = dim3((kmeans_point_count - 1)/32 + 1, (kmeans_cluster_count - 1)/32 + 1);
     dim3 blockDim = dim3(32, 32);
     all_dots<<<gridDim, blockDim>>>(thrust::raw_pointer_cast(data_dots.data()),
         thrust::raw_pointer_cast(centroid_dots.data()),
-        thrust::raw_pointer_cast(dots.data()));
+        thrust::raw_pointer_cast(dots.data()), kmeans_point_count, kmeans_cluster_count);
 }
 
 struct cublas_state {
@@ -195,11 +200,11 @@ void gemm(cublasOperation_t transa, cublasOperation_t transb,
 /**
  * @brief results are stored in pairwise_distance
  * 
- * @param data size = (SITES_NUMBER * DIM)
- * @param centroids size = (KMEANS_K * DIM)
- * @param data_dots size = (SITES_NUMBER)
- * @param centroid_dots size = (KMEANS_K)
- * @param pairwise_distances size = (SITES_NUMBER * KMEANS_K)
+ * @param data size = (kmeans_point_count * DIM)
+ * @param centroids size = (kmeans_cluster_count * DIM)
+ * @param data_dots size = (kmeans_point_count)
+ * @param centroid_dots size = (kmeans_cluster_count)
+ * @param pairwise_distances size = (kmeans_point_count * kmeans_cluster_count)
  */
 template<typename T>
 void calculate_distances(thrust::device_vector<T>& data,
@@ -207,7 +212,7 @@ void calculate_distances(thrust::device_vector<T>& data,
                          thrust::device_vector<T>& data_dots,
                          thrust::device_vector<T>& centroid_dots,
                          thrust::device_vector<T>& pairwise_distances) {
-    make_self_dots(centroids, centroid_dots, KMEANS_K);
+    make_self_dots(centroids, centroid_dots, kmeans_cluster_count);
     make_all_dots(data_dots, centroid_dots, pairwise_distances);
     // C = alpha * A * B + beta * C
     //||x - y||^2 = ||x||^2 + ||y||^2 - 2xy
@@ -220,28 +225,29 @@ void calculate_distances(thrust::device_vector<T>& data,
     //But the data is in row major order, so we have to permute
     //the arguments a little
     gemm(CUBLAS_OP_T, CUBLAS_OP_N,
-         SITES_NUMBER, KMEANS_K, DIM, &alpha,
+         kmeans_point_count, kmeans_cluster_count, DIM, &alpha,
          thrust::raw_pointer_cast(data.data()),
          DIM,//Has to be n or d
          thrust::raw_pointer_cast(centroids.data()),
          DIM,//Has to be k or d
          &beta,
          thrust::raw_pointer_cast(pairwise_distances.data()),
-         SITES_NUMBER); //Has to be n or k
+         kmeans_point_count); //Has to be n or k
 }
 
 // Each thread traverse all centroid and determine the nearest centroid to one point.
 // The distance to the new centroid is stored in array distances.
 // Atomic add the count of changes to the global variable changes, which should be comment out for performance.
 template<typename T>
-__global__ void make_new_labels(T* pairwise_distances, int* labels, int* changes, T* distances) {
+__global__ void make_new_labels(T* pairwise_distances, int* labels, int* changes, T* distances,\
+    int point_count, int cluster_count) {
     T min_distance = DBL_MAX;
     T min_idx = -1;
     int global_id = threadIdx.x + blockIdx.x * blockDim.x;
-    if (global_id < SITES_NUMBER) {
+    if (global_id < point_count) {
         int old_label = labels[global_id];
-        for(int c = 0; c < KMEANS_K; c++) {
-            T distance = pairwise_distances[c * SITES_NUMBER + global_id];
+        for(int c = 0; c < cluster_count; c++) {
+            T distance = pairwise_distances[c * point_count + global_id];
             if (distance < min_distance) {
                 min_distance = distance;
                 min_idx = c;
@@ -263,12 +269,12 @@ int relabel(thrust::device_vector<T>& pairwise_distances,
             thrust::device_vector<T>& distances) {
     thrust::device_vector<int> changes(1);
     changes[0] = 0;
-    dim3 gridDim = dim3((SITES_NUMBER - 1) / 256 + 1);
+    dim3 gridDim = dim3((kmeans_point_count - 1) / 256 + 1);
     dim3 blockDim = dim3(256);
     make_new_labels<<<gridDim, blockDim>>>(thrust::raw_pointer_cast(pairwise_distances.data()),
         thrust::raw_pointer_cast(labels.data()),
         thrust::raw_pointer_cast(changes.data()),
-        thrust::raw_pointer_cast(distances.data()));
+        thrust::raw_pointer_cast(distances.data()), kmeans_point_count, kmeans_cluster_count);
     return changes[0];
 }
 
@@ -310,9 +316,9 @@ void update_centroid(int label, int dimension,
  */
 template<typename T>
 __global__ void calculate_centroids(T* data, int* ordered_labels,
-    int* ordered_indices, T* centroids, int* counts_cen) {
+    int* ordered_indices, T* centroids, int* counts_cen, int point_count) {
     int in_flight = blockDim.y * gridDim.y;
-    int labels_per_row = (SITES_NUMBER - 1) / in_flight + 1;
+    int labels_per_row = (point_count - 1) / in_flight + 1;
 
     // accumulate the coord in each dimension
     for(int dimension = threadIdx.x; dimension < DIM; dimension += blockDim.x) {
@@ -321,9 +327,9 @@ __global__ void calculate_centroids(T* data, int* ordered_labels,
         int global_id = threadIdx.y + blockIdx.y * blockDim.y;      // index of point
         int start = global_id * labels_per_row;
         int end = (global_id + 1) * labels_per_row;
-        end = (end > SITES_NUMBER) ? SITES_NUMBER : end;
+        end = (end > point_count) ? point_count : end;
         int prior_label;
-        if (start < SITES_NUMBER) {
+        if (start < point_count) {
             prior_label = ordered_labels[start];
         
             for(int label_number = start; label_number < end; label_number++) {
@@ -351,10 +357,10 @@ __global__ void calculate_centroids(T* data, int* ordered_labels,
 // each coordinate of a centroid is divided by its point count
 // if a cluster has 3 points, the coord will become (x/3, y/3)
 template<typename T>
-__global__ void scale_centroids(int* counts, T* centroids) {
+__global__ void scale_centroids(int* counts, T* centroids, int cluster_count) {
     int global_id_x = threadIdx.x + blockIdx.x * blockDim.x;
     int global_id_y = threadIdx.y + blockIdx.y * blockDim.y;
-    if ((global_id_x < DIM) && (global_id_y < KMEANS_K)) {
+    if ((global_id_x < DIM) && (global_id_y < cluster_count)) {
         int count = counts[global_id_y];
         //To avoid introducing divide by zero errors
         //If a centroid has no weight, we'll do no normalization
@@ -383,12 +389,12 @@ void find_centroids(thrust::device_vector<T>& data,
                     thrust::device_vector<int> labels,
                     thrust::device_vector<T>& centroids,
                     thrust::device_vector<int>& point_counts) {
-    thrust::device_vector<int> indices(SITES_NUMBER);
+    thrust::device_vector<int> indices(kmeans_point_count);
     // reset point_counts to all zeros
     thrust::fill(point_counts.begin(), point_counts.end(), 0);
 
     thrust::copy(thrust::counting_iterator<int>(0),
-                 thrust::counting_iterator<int>(SITES_NUMBER),
+                 thrust::counting_iterator<int>(kmeans_point_count),
                  indices.begin());
     //Bring all labels with the same value together
     thrust::sort_by_key(labels.begin(),
@@ -410,12 +416,12 @@ void find_centroids(thrust::device_vector<T>& data,
          thrust::raw_pointer_cast(labels.data()),
          thrust::raw_pointer_cast(indices.data()),
          thrust::raw_pointer_cast(centroids.data()),
-         thrust::raw_pointer_cast(point_counts.data()));
+         thrust::raw_pointer_cast(point_counts.data()), kmeans_point_count);
     
     //Scale centroids, because the calculate_centroid kernel just add the coord up.
-    scale_centroids<<<dim3((DIM - 1)/32 + 1, (KMEANS_K - 1)/32 + 1), dim3(32, 32)>>>
+    scale_centroids<<<dim3((DIM - 1)/32 + 1, (kmeans_cluster_count - 1)/32 + 1), dim3(32, 32)>>>
         (thrust::raw_pointer_cast(point_counts.data()),
-         thrust::raw_pointer_cast(centroids.data()));
+         thrust::raw_pointer_cast(centroids.data()), kmeans_cluster_count);
 }
 
 
@@ -456,13 +462,13 @@ int kmeans(int iterations,
            thrust::device_vector<T>& distances,
            bool init_from_labels=true,
            double threshold=EARLY_TERM_THRES) {
-    thrust::device_vector<T> data_dots(SITES_NUMBER);
-    // in the original version, the size of centroid_dots is SITES_NUMBER (n)
-    thrust::device_vector<T> centroid_dots(KMEANS_K);
-    thrust::device_vector<int> point_counts(KMEANS_K);      // the number of points in each cluster
-    thrust::device_vector<T> pairwise_distances(SITES_NUMBER * KMEANS_K);
+    thrust::device_vector<T> data_dots(kmeans_point_count);
+    // in the original version, the size of centroid_dots is kmeans_point_count (n)
+    thrust::device_vector<T> centroid_dots(kmeans_cluster_count);
+    thrust::device_vector<int> point_counts(kmeans_cluster_count);      // the number of points in each cluster
+    thrust::device_vector<T> pairwise_distances(kmeans_point_count * kmeans_cluster_count);
     
-    make_self_dots(data, data_dots, SITES_NUMBER);
+    make_self_dots(data, data_dots, kmeans_point_count);
 
     if (init_from_labels) {
         find_centroids(data, labels, centroids, point_counts);
@@ -493,7 +499,7 @@ int kmeans(int iterations,
                 // debug, print the point count in each cluster
                 thrust::host_vector<int> point_counts_h = point_counts;      // the number of points in each cluster
                 int *point_counts_raw = thrust::raw_pointer_cast(point_counts_h.data());
-                for (int cl = 0; cl < KMEANS_K; ++cl) {
+                for (int cl = 0; cl < kmeans_cluster_count; ++cl) {
                     printf("Number of points in cluster %d: %d\n", cl, point_counts_raw[cl]);
                 }
 #endif
@@ -505,7 +511,7 @@ int kmeans(int iterations,
 
 #if KMEANS_DEBUG == 1
     // debug, print the point count in each cluster
-    for (int cl = 0; cl < KMEANS_K; ++cl) {
+    for (int cl = 0; cl < kmeans_cluster_count; ++cl) {
         printf("Number of points in cluster %d: %d\n", cl, (int)point_counts[cl]);
     }
 #endif
@@ -534,18 +540,18 @@ void random_labels(thrust::device_vector<int>& labels, int n, int k) {
 template<typename T>
 void kmeans_plus_plus(T *data, T *centroids) {
     // probility to be a centroid of each point
-    double prob[SITES_NUMBER];
+    double prob[kmeans_point_count];
     // stores the distance of each point to the nearest centroid
-    double dist[SITES_NUMBER];
+    double dist[kmeans_point_count];
     double total_dist;
-    // init prob of all point to 1/SITES_NUMBER
-    for (int i = 0; i < SITES_NUMBER; ++i) {
-        prob[i] = 1/SITES_NUMBER;
+    // init prob of all point to 1/kmeans_point_count
+    for (int i = 0; i < kmeans_point_count; ++i) {
+        prob[i] = 1/kmeans_point_count;
     }
 
     // randomly choose the first centroid
     double ran_num = (T)rand() / (T)RAND_MAX;
-    for (int i = 0; i < SITES_NUMBER; ++i) {
+    for (int i = 0; i < kmeans_point_count; ++i) {
         ran_num -= prob[i];
         if (ran_num <= 0) {     // select the point that make the ran_num less than 0
             for (int d = 0; d < DIM; ++d)
@@ -556,7 +562,7 @@ void kmeans_plus_plus(T *data, T *centroids) {
 
     // compute the dist from each point to the first centroid
     total_dist = 0;
-    for (int i = 0; i < SITES_NUMBER; ++i) {
+    for (int i = 0; i < kmeans_point_count; ++i) {
         dist[i] = 0;
         for (int d = 0; d < DIM; ++d)
             dist[i] += (data[i * DIM + d] - centroids[0 * DIM + d]) * (data[i * DIM + d] - centroids[0 * DIM + d]);
@@ -564,15 +570,15 @@ void kmeans_plus_plus(T *data, T *centroids) {
     }
 
     // compute the remaining clusters
-    for (int cl = 1; cl < KMEANS_K; ++cl) {
+    for (int cl = 1; cl < kmeans_cluster_count; ++cl) {
 
         // change the prob based on the dist
-        for (int i = 0; i < SITES_NUMBER; ++i) {
+        for (int i = 0; i < kmeans_point_count; ++i) {
             prob[i] = dist[i] / total_dist;
         }
 
         ran_num = (T)rand() / (T)RAND_MAX;      // a new random number
-        for (int i = 0; i < SITES_NUMBER; ++i) {
+        for (int i = 0; i < kmeans_point_count; ++i) {
             ran_num -= prob[i];
             if (ran_num <= 0) {     // select the point that make the ran_num less than 0
                 for (int d = 0; d < DIM; ++d)
@@ -583,7 +589,7 @@ void kmeans_plus_plus(T *data, T *centroids) {
 
         // compute the dist from each point to the neaerst centroid
         total_dist = 0;
-        for (int i = 0; i < SITES_NUMBER; ++i) {
+        for (int i = 0; i < kmeans_point_count; ++i) {
             dist[i] = DBL_MAX;
             for (int cur_cl = 0; cur_cl < cl; ++cur_cl) {
                 double cur_dist = 0;
@@ -603,23 +609,25 @@ void kmeans_plus_plus(T *data, T *centroids) {
  * @brief generate k clusters using kmeans method
  * The centroids of each clusters are initialized with kmeans++ method
  * 
- * @param data_raw input data, its size is [SITES_NUMBER * DIM]
+ * @param data_raw input data, its size is [kmeans_point_count * DIM]
  * @param labels_raw output data, assign a label to each data point
  */
 template<typename T>
-void gen_kclusters(T *data_raw, T* labels_raw) {
-	T centroids_raw[KMEANS_K * DIM];
+void gen_kclusters(T *data_raw, T* labels_raw, int kmeans_point_count_in, int kmeans_cluster_count_in) {
+    kmeans_point_count = kmeans_cluster_count_in;
+    kmeans_cluster_count = kmeans_cluster_count_in;
+	T centroids_raw[kmeans_cluster_count * DIM];
     // TODO: Use kmeans++ to init this array
     kmeans_plus_plus(data_raw, centroids_raw);
 	
-	thrust::device_vector<double> data(data_raw, data_raw + SITES_NUMBER * DIM);
-    thrust::device_vector<double> centroids(centroids_raw, centroids_raw + KMEANS_K * DIM);
-    thrust::device_vector<int> labels(SITES_NUMBER);
-    thrust::device_vector<double> distances(SITES_NUMBER);
+	thrust::device_vector<double> data(data_raw, data_raw + kmeans_point_count * DIM);
+    thrust::device_vector<double> centroids(centroids_raw, centroids_raw + kmeans_cluster_count * DIM);
+    thrust::device_vector<int> labels(kmeans_point_count);
+    thrust::device_vector<double> distances(kmeans_point_count);
 
     kmeans(MAX_KMEANS_ITER, data, labels, centroids, distances, false);
 
-    for(int i = 0; i < SITES_NUMBER; ++i)
+    for(int i = 0; i < kmeans_point_count; ++i)
         labels_raw[i] = labels[i];
 }
 
@@ -629,20 +637,20 @@ template<typename T>
 void test() {
     int iterations = 50;
 
-    T data_raw[SITES_NUMBER * DIM];
+    T data_raw[kmeans_point_count * DIM];
     // init data_raw with random number
-    for(int i = 0; i < SITES_NUMBER * DIM; i++) {
+    for(int i = 0; i < kmeans_point_count * DIM; i++) {
         data_raw[i] = (T)rand() / (T)RAND_MAX * (T)PIC_WIDTH;
     }
 
-	T centroids_raw[KMEANS_K * DIM];
+	T centroids_raw[kmeans_cluster_count * DIM];
     // TODO: Use kmeans++ to init this array
     kmeans_plus_plus(data_raw, centroids_raw);
 	
-	thrust::device_vector<double> data(data_raw, data_raw + SITES_NUMBER * DIM);
-    thrust::device_vector<double> centroids(centroids_raw, centroids_raw + KMEANS_K * DIM);
-    thrust::device_vector<int> labels(SITES_NUMBER);
-    thrust::device_vector<double> distances(SITES_NUMBER);
+	thrust::device_vector<double> data(data_raw, data_raw + kmeans_point_count * DIM);
+    thrust::device_vector<double> centroids(centroids_raw, centroids_raw + kmeans_cluster_count * DIM);
+    thrust::device_vector<int> labels(kmeans_point_count);
+    thrust::device_vector<double> distances(kmeans_point_count);
     
     std::cout << "Number of iterations: " << iterations << std::endl;
     std::cout << "Precision: " << typeid(T).name() << std::endl;
