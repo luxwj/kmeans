@@ -613,7 +613,7 @@ void kmeans_plus_plus(T *data, T *centroids) {
  * @param labels_raw output data, assign a label to each data point
  */
 template<typename T>
-void gen_kclusters(T *data_raw, T* labels_raw, int kmeans_point_count_in, int kmeans_cluster_count_in) {
+void gen_kclusters(T *data_raw, int* labels_raw, int kmeans_point_count_in, int kmeans_cluster_count_in) {
     kmeans_point_count = kmeans_cluster_count_in;
     kmeans_cluster_count = kmeans_cluster_count_in;
 	T centroids_raw[kmeans_cluster_count * DIM];
