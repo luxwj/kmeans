@@ -606,7 +606,7 @@ void kmeans_plus_plus(T *data, T *centroids) {
 }
 
 /**
- * @brief generate k clusters using kmeans method
+ * @brief generate k clusters using kmeans method, the data_raw is float or double
  * The centroids of each clusters are initialized with kmeans++ method
  * 
  * @param data_raw input data, its size is [kmeans_point_count * DIM]
@@ -614,7 +614,7 @@ void kmeans_plus_plus(T *data, T *centroids) {
  */
 template<typename T>
 void gen_kclusters(T *data_raw, int* labels_raw, int kmeans_point_count_in, int kmeans_cluster_count_in) {
-    kmeans_point_count = kmeans_cluster_count_in;
+    kmeans_point_count = kmeans_point_count_in;
     kmeans_cluster_count = kmeans_cluster_count_in;
 	T centroids_raw[kmeans_cluster_count * DIM];
     // TODO: Use kmeans++ to init this array
