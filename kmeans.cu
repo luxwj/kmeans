@@ -36,8 +36,8 @@ limitations under the License.
 
 // set to 1 to print informations, set to 0 for performance
 #define KMEANS_DEBUG 1
-// 0.001%
-#define EARLY_TERM_THRES 0.00001
+// 0.01%
+#define EARLY_TERM_THRES 0.001
 #define MAX_KMEANS_ITER 50
 
 #if KMEANS_DEBUG == 0
@@ -80,14 +80,14 @@ __global__ void self_dots(T* data, T* dots, int point_count) {
  * 
  * @param data 
  * @param dots 
- * @param data_size the array length of data
+ * @param data_size the point count / centroid count of data
  */
 template<typename T>
 void make_self_dots(thrust::device_vector<T>& data,
                     thrust::device_vector<T>& dots,
                     const int data_size) {
     self_dots<<<(data_size - 1)/256+1, 256>>>(thrust::raw_pointer_cast(data.data()),
-        thrust::raw_pointer_cast(dots.data()), kmeans_point_count);
+        thrust::raw_pointer_cast(dots.data()), data_size);
 }
 
 
