@@ -53,3 +53,9 @@ New features:
 ## Log 220718
 
 Now point count and cluster count can be inputted by user.
+
+## Log 220721
+
+Bug fixed:
+* Correctly deal with 0 input point, or the situation that input point count is smaller than cluster count. (In kmeans++)
+* Add a ZERO_CHECK for distance computing

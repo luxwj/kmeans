@@ -37,7 +37,7 @@ limitations under the License.
 // set to 1 to print informations, set to 0 for performance
 #define KMEANS_DEBUG 1
 // 0.01%
-#define EARLY_TERM_THRES 0.001
+#define EARLY_TERM_THRES 0.00001
 #define MAX_KMEANS_ITER 50
 
 #if KMEANS_DEBUG == 0
@@ -47,10 +47,61 @@ static int kmeans_cluster_count;
 
 #elif KMEANS_DEBUG == 1
 #define PIC_WIDTH 2048
-static int kmeans_point_count = 100000;
+static int kmeans_point_count = 10000;
 static int kmeans_cluster_count = 128;
 #define DIM 2
 #endif
+
+#define ZERO_CHECK(x) (x < 0.000000000000001) ? 0 : x
+
+// Compute the sum of a double array
+// Call this kernel with blockDim=(1024, 1, 1)
+__global__ void kmeans_double_reduction_kernel(volatile double *data, const int data_size) {
+    // compact the data into the first blockDim.x positions
+    int tid = threadIdx.x;
+
+    // check for zeros
+    if (tid < data_size) {
+        if (data[tid] < 0.000000000000001)          // < 10^-15
+            data[tid] = 0;
+    }
+
+    for (int idx = tid + blockDim.x; idx < data_size; idx += blockDim.x) {
+        if (data[tid] > 0.000000000000001)
+            data[tid] += data[idx];
+    }
+
+    if (data_size > 512 && tid + 512 < data_size) {
+        data[tid] += data[tid + 512];
+    }    
+    if (data_size > 256 && tid + 256 < data_size) {
+        data[tid] += data[tid + 256];
+    }
+    if (data_size > 128 && tid + 128 < data_size) {
+        data[tid] += data[tid + 128];
+    }    
+    if (data_size > 64 && tid + 64 < data_size) {
+        data[tid] += data[tid + 64];
+    }
+    if (data_size > 32 && tid + 32 < data_size) {
+        data[tid] += data[tid + 32];
+    }    
+    if (data_size > 16 && tid + 16 < data_size) {
+        data[tid] += data[tid + 16];
+    }
+    if (data_size > 8 && tid + 8 < data_size) {
+        data[tid] += data[tid + 8];
+    }    
+    if (data_size > 4 && tid + 4 < data_size) {
+        data[tid] += data[tid + 4];
+    }
+    if (data_size > 2 && tid + 2 < data_size) {
+        data[tid] += data[tid + 2];
+    }    
+    if (data_size > 1 && tid + 1 < data_size) {
+        data[tid] += data[tid + 1];
+    }
+}
 
 //data: points in row-major order (kmeans_point_count rows, DIM cols)
 //dots: result vector (kmeans_point_count rows). dots[tid] = x*x + y*y + ...
@@ -247,14 +298,15 @@ __global__ void make_new_labels(T* pairwise_distances, int* labels, int* changes
     if (global_id < point_count) {
         int old_label = labels[global_id];
         for(int c = 0; c < cluster_count; c++) {
-            T distance = pairwise_distances[c * point_count + global_id];
+            T distance = ZERO_CHECK(pairwise_distances[c * point_count + global_id]);
             if (distance < min_distance) {
                 min_distance = distance;
                 min_idx = c;
             }
         }
         labels[global_id] = min_idx;
-        distances[global_id] = sqrt(min_distance);
+
+        distances[global_id] = sqrt(ZERO_CHECK(min_distance));
         if (old_label != min_idx) {
             atomicAdd(changes, 1);
         }
@@ -300,8 +352,6 @@ void update_centroid(int label, int dimension,
         atomicAdd(counts_cen + label, count);
     }             
 }
-
-
 
 /**
  * @brief This function only adds up the point coords but not divide the count.
@@ -425,6 +475,7 @@ void find_centroids(thrust::device_vector<T>& data,
 }
 
 
+
 //! kmeans clusters data into k groups
 /*! 
   
@@ -478,12 +529,12 @@ int kmeans(int iterations,
     for(; i < iterations; i++) {
         calculate_distances(data, centroids, data_dots,
             centroid_dots, pairwise_distances);
-
-        // debug: print the count of changes
         int changes = relabel(pairwise_distances, labels, distances);
-        
         find_centroids(data, labels, centroids, point_counts);
         T distance_sum = thrust::reduce(distances.begin(), distances.end());
+
+        // kmeans_double_reduction_kernel<<<dim3(1, 1, 1), dim3(1024, 1, 1)>>>
+        //     (thrust::raw_pointer_cast(distances.data()), kmeans_point_count);
 
 #if KMEANS_DEBUG == 1
         std::cout << "Iteration " << i << " produced " << changes
@@ -492,16 +543,18 @@ int kmeans(int iterations,
 
         // early terminating condition
         if (i > 0) {
-            T delta = abs((distance_sum - prior_distance_sum) / prior_distance_sum);
+            T delta;
+            if (prior_distance_sum == 0)
+                delta = 0;
+            else
+                delta = abs((distance_sum - prior_distance_sum) / prior_distance_sum);
+
             if (delta < threshold) {
 #if KMEANS_DEBUG == 1
                 std::cout << "Threshold triggered, terminating iterations early" << std::endl;
                 // debug, print the point count in each cluster
                 thrust::host_vector<int> point_counts_h = point_counts;      // the number of points in each cluster
                 int *point_counts_raw = thrust::raw_pointer_cast(point_counts_h.data());
-                for (int cl = 0; cl < kmeans_cluster_count; ++cl) {
-                    printf("Number of points in cluster %d: %d\n", cl, point_counts_raw[cl]);
-                }
 #endif
                 return i + 1;
             }
@@ -546,7 +599,7 @@ void kmeans_plus_plus(T *data, T *centroids) {
     double total_dist;
     // init prob of all point to 1/kmeans_point_count
     for (int i = 0; i < kmeans_point_count; ++i) {
-        prob[i] = 1/kmeans_point_count;
+        prob[i] = (double) 1 / (double) kmeans_point_count;
     }
 
     // randomly choose the first centroid
@@ -572,6 +625,9 @@ void kmeans_plus_plus(T *data, T *centroids) {
     // compute the remaining clusters
     for (int cl = 1; cl < kmeans_cluster_count; ++cl) {
 
+        for (int d = 0; d < DIM; ++d)       // sentinel value
+            centroids[cl * DIM + d] = -1;
+
         // change the prob based on the dist
         for (int i = 0; i < kmeans_point_count; ++i) {
             prob[i] = dist[i] / total_dist;
@@ -587,11 +643,16 @@ void kmeans_plus_plus(T *data, T *centroids) {
             }
         }
 
-        // compute the dist from each point to the neaerst centroid
+        if (centroids[cl * DIM + 0] == -1) {    // if did init the centroid successfully, randomly pick coords
+            for (int d = 0; d < DIM; ++d)
+                centroids[cl * DIM + d] = (T)rand() / (T)RAND_MAX * (T)PIC_WIDTH;
+        }
+
+        // compute the dist from each point to the nearest centroid
         total_dist = 0;
         for (int i = 0; i < kmeans_point_count; ++i) {
             dist[i] = DBL_MAX;
-            for (int cur_cl = 0; cur_cl < cl; ++cur_cl) {
+            for (int cur_cl = 0; cur_cl <= cl; ++cur_cl) {
                 double cur_dist = 0;
                 for (int d = 0; d < DIM; ++d)
                     cur_dist += (data[i * DIM + d] - centroids[cur_cl * DIM + d]) * (data[i * DIM + d] - centroids[cur_cl * DIM + d]);
@@ -602,7 +663,6 @@ void kmeans_plus_plus(T *data, T *centroids) {
             total_dist += dist[i];
         }
     }
-
 }
 
 /**
@@ -614,10 +674,14 @@ void kmeans_plus_plus(T *data, T *centroids) {
  */
 template<typename T>
 void gen_kclusters(T *data_raw, int* labels_raw, int kmeans_point_count_in, int kmeans_cluster_count_in) {
+    if (kmeans_point_count_in == 0) {
+        printf("Point count is 0, return directly\n");
+        return;
+    }
     kmeans_point_count = kmeans_point_count_in;
     kmeans_cluster_count = kmeans_cluster_count_in;
 	T centroids_raw[kmeans_cluster_count * DIM];
-    // TODO: Use kmeans++ to init this array
+    // Use kmeans++ to init centroids_raw
     kmeans_plus_plus(data_raw, centroids_raw);
 	
 	thrust::device_vector<double> data(data_raw, data_raw + kmeans_point_count * DIM);
@@ -635,7 +699,11 @@ void gen_kclusters(T *data_raw, int* labels_raw, int kmeans_point_count_in, int 
 #if KMEANS_DEBUG == 1
 template<typename T>
 void test() {
-    int iterations = 50;
+    int iterations = MAX_KMEANS_ITER;
+
+    if (kmeans_point_count == 0) {
+        printf("Point count is 0, return directly\n");
+    }
 
     T data_raw[kmeans_point_count * DIM];
     // init data_raw with random number
@@ -644,7 +712,7 @@ void test() {
     }
 
 	T centroids_raw[kmeans_cluster_count * DIM];
-    // TODO: Use kmeans++ to init this array
+    // Use kmeans++ to init centroids_raw
     kmeans_plus_plus(data_raw, centroids_raw);
 	
 	thrust::device_vector<double> data(data_raw, data_raw + kmeans_point_count * DIM);
